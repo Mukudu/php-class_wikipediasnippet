@@ -1,55 +1,67 @@
  <?php
-
 /*
-    wikipedia php library
+    Wikipedia PHP library.
+    A PHP library to communicate with wikipedia through the API
+    see (https://www.mediawiki.org/wiki/API:Main_page)
+    to allow PHP scripts to obtain snippets of wikipedia pages.
 
-    libary to communicate with wikipedia via api.php and index.php
-    to allow php scripts to obtain wikipedia pages
+    Feb 2021
+    * Updated to use the JSON reponses.
+    * Dropped support for raw output.
 
-    object orientated??
-
-    using xml format due to protability - php formats proving unreliable - especially serialisation
 */
 
 class WikipediaSnippet {
 
-    private $version = '20200418-01';
-    private $wiki_api_url ='https://en.wikipedia.org/w/api.php';
+    private $version = '20210128-01';
 
     private $debugging = false;
 
-    // defaults
-    private $useragent = 'Mozilla/5.0 (Windows; U; Windows NT 5.1; en-US; rv:1.8.1.9) Gecko/20071025 Firefox/2.0.0.9';
+    // User-Agent: CoolToolName/0.0 (https://example.org/cool-tool/; cool-tool@example.org) used-base-library/0.0
+    //<client name>/<version> (<contact information>) <library/framework name>/<version> [<library name>/<version> ...]
+    private $useragent = '';
     private $http_proxy = '';
-    private $rawoutput = false;
+    private $wiki_api_url ='http://en.wikipedia.org/w/api.php';
+    private $wiki_source_msg = 'Wikipedia - (http://en.wikipedia.org/)';
+    private $reponseformat = 'json';
 
     // content stuff
+    private $content = '';
     private $wiki_content_url = '';
     private $rawtitle = '';
     private $title = '';
-    private $pageid = null;
+    private $pageid = 0;
     private $snippets = array();         // including infobox, preamble, #sections
-    private $toc = null;
-    private $toclookup = array();
+    private $toc = '';
 
     public $url = '';
     public $redirected = false;         //has this been redirected
     public $error = '';
 
+    // constructor
     public function __construct() {
-        $this->useragent = 'WikipediaSnippet/' . $this->version . ' (https://github.com/Mukudu/php-class_wikipediasnippet)';
+        $version = $this->version();
+        $this->useragent = "WikipediaSnippet/$version (https://github.com/Mukudu/php-class_wikipediasnippet; benellis@mukudu.net) php-class_wikipediasnippet/$version";
     }
 
-    //determine if the caller just wants wiki text or xml in the case of the toc.
-    public function setRawOutput($otype = false) {
-        if ($this->debugging) error_log("Setting Raw output to '$otype'");
-        $this->rawoutput = $otype;
+    public function version() {
+        return $this->version;
     }
 
-    //set a different user agent - if no setting - current remains in force.
+
+    public function setWikiSourceMsg($sourcemsg) {
+        if ($sourcemsg) {
+            if ($this->debugging) error_log('Source text is being reset to ' . $sourcemsg);
+            $this->wiki_source_msg = $sourcemsg;
+        }
+    }
+
+    // Set a different user agent - if no setting - current remains in force.
     public function setUserAgent($useragent) {
-        if ($this->debugging) error_log('/eragent is being reset to ' . $useragent);
-        $this->useragent = $useragent;
+        if ($useragent) {
+            if ($this->debugging) error_log('Useragent is being reset to ' . $useragent);
+            $this->useragent = $useragent;
+        }
     }
 
     // set a proxy for curl requests - if empty proxy is unset
@@ -58,7 +70,7 @@ class WikipediaSnippet {
         $this->http_proxy = $proxy;     //if empty proxy is unset
     }
 
-    //set the wiki API url - if not set current stays in force
+    // set the wiki API url - if not set current stays in force
     public function setWikiAPI_URL($wiki_api) {
         if ($wiki_api) {
             if ($this->debugging) error_log("Wiki API URL set to '$wiki_api'");
@@ -66,12 +78,12 @@ class WikipediaSnippet {
         }
     }
 
-    public function getWikiContent($url, $nolinks=false, $noimages=false) {
+    public function getWikiContent($url, $nolinks=false, $noimages=false, $includecitations = false) {
         $result = '';
 
        if ($this->debugging) error_log('DEBUG mode - please switch off in production environments');
 
-        $webaddress = parse_url($url);   //break up the url into parts - scheme - e.g. http ,host,port,user,pass,path,query - after the question mark ?,fragment - after the hashmark
+        $webaddress = parse_url($url);   // Parse the url into parts
 
         if (!$webaddress) { //
             $this->_raiseError('This is not a proper URL');
@@ -85,136 +97,229 @@ class WikipediaSnippet {
 
             //more url stuff for later
             $baseurl = $webaddress['scheme'].'://'.$webaddress['host'];
-            $this->wiki_content_url = $baseurl . pathinfo($webaddress['path'],PATHINFO_DIRNAME) . '/';
+            $this->wiki_content_url = $baseurl . pathinfo($webaddress['path'], PATHINFO_DIRNAME) . '/';
             if ($this->debugging) error_log('Wiki Content URL determined to be ' . $this->wiki_content_url);
             $this->url = $baseurl . $webaddress['path'];
             if ($this->debugging) error_log('Request URL determined to be ' . $this->url);
 
-            // Table of Contents
-            $this->_get_toc($url);  // an array that we can use in php - xml in $this->toc - could be empty
+            // first we need to get a table of contents
+            // this may be cached locally and so save us some time
+            $toc = $this->_get_toc($url);                   //an array that we can use in php - json in $this->toc  // could be empty
 
             //use the toc to determine the section we want if not the toc itself
             if ($webaddress['fragment'] != 'toc') {                     //is this the toc?
                 if ($webaddress['fragment'] == 'infobox' || $webaddress['fragment'] == 'preamble') {
                     $section = 0;
-                }else if (count($this->toclookup) == 0) {           //catches redirects as well
+                }else if (count($toc) == 0) {           //catches redirects as well
                     $section = 0;
                 }else{
-                    if (!$section=$this->toclookup[$webaddress['fragment']]) {          //if not, then we want a valid section
-                        $section = $this->toclookup[strtolower($webaddress['fragment'])];       //this should never have to happen
+                    if (!$section=$toc[$webaddress['fragment']]) {          //if not, then we want a valid section
+                        $section = $toc[strtolower($webaddress['fragment'])];       //this should never have to happen
                     }
                 }
 
-                //output
-                $type = 'text';     // default HTML
-                if (!empty($this->rawoutput)) $type = 'wikitext'; // wikitext
-
-                // create the request URL for the wikipedia API
+                // Create the request URL for the wikipedia API
                 $cparams = array(
-                    "format" => "json",
-                    'formatversion' => 2,
-                    "action" => "parse",
-                    "pageid" => $this->pageid,
+                    'action' => 'parse',
+                    'page' => $this->rawtitle,
+                    'prop' => 'text',
                     'section' => $section,
-                    'prop' => $type,           // 'text'
-                    'redirects' => ''
+                    'format' => 'json',
+                    'redirects' => '',
+                    'disableeditsection' => '',
                 );
-
-//                 echo '<pre>' . print_r($this->toclookup, true) . '</pre>';
-//                 die('<pre>' . print_r($cparams, true) . '</pre>');
 
                 $geturl = $this->_makeWikiAPIcall($cparams);
 
                 if ($this->debugging) error_log("Content API call being made to '$geturl'");
 
-                if ($response = $this->_getWikiPage($geturl)) {             //make the call
-                    if (($response = json_decode($response)) !== false) {          // turn the response into an JSON object to make it easier to work with
-                        if ($response && empty($response->error)) {
+                if ($response = $this->_getWikiPage($geturl)) {             //make the call.
 
-                            if ($this->debugging) error_log("Non Error response returned - making JSON Object");
+                    if ($this->debugging) error_log("Non Error response returned - making JSON Object");
 
-                            $result = $response->parse->$type;
+                    if ($response = $this->_response2JSON($response)) { // turn the reponse into an JSON object to make it easier to work with
+                        //extract the page info
+                        $this->title = $response->parse->title;
+                        $this->pageid = $response->parse->pageid;
 
-                            if (!empty($this->rawoutput)) {
-                                if ($section == 0) {
-                                    //not doing this by regex - too bloody hard
-                                    $lines = explode("\n",$result);
-                                    $content = array();
-                                    $inbox = false;
-                                    foreach ($lines as $line) {
-                                        if (stripos( $line, '{{infobox' ) === 0) {
-                                            $inbox = true;
-                                        }elseif (strpos($line,'{{') === 0) {            //ignore all other formating stuff before the preamble
-                                            continue;
-                                        }elseif ($line == '}}') {                       //end infobox
-                                            if ($webaddress['fragment'] == 'infobox') {
-                                                $content[] = $line;
-                                            }
-                                            $inbox = false;
-                                            continue;
-                                        }
+                        //redirects should not happen according to the docs if you call with redirects param
+                        $result = (array) $response->parse->text;
+                        $result = $result['*'];
+                        libxml_use_internal_errors(true);       // we want to catch any errors
+                        $doc = new DOMDocument();
+                        if ($doc->loadHTML($result)) {
+                            // Remove images
+                            if ($noimages) {
+                                // Images are housed in divs named thumbs
+                                $allimagenodes = $doc->getElementsByTagName('div');
+                                $fnddivs = array();
+                                foreach ($allimagenodes as $div) {
+                                    if (in_array('thumb', (explode(' ' , $div->getAttribute('class'))))) {
+                                        $fnddivs[] = $div;
+                                    }
+                                }
+                                foreach ($fnddivs as $div) {
+                                    $div->parentNode->removeChild($div);
+                                }
+                                // Catch any outside of that.
+                                $allimages = $doc->getElementsByTagName('img');
+                                $orphanimgs = array();
+                                foreach($allimages as $img) {
+                                    $orphanimgs[] = $img;
+                                }
+                                foreach ($orphanimgs as $img) {
+                                    $img->parentNode->removeChild($img);
+                                }
+                                // And sometimes we have captions - arrgghhh
+                                $allcaptions = $doc->getElementsByTagName('caption');
+                                $orphancaps = array();
+                                foreach($allcaptions as $img) {
+                                    $orphancaps[] = $img;
+                                }
+                                foreach ($orphancaps as $caption) {
+                                    $caption->parentNode->removeChild($caption);
+                                }
+                            }
 
-                                        if (($inbox) && ($webaddress['fragment'] == 'infobox')) {
-                                            $content[] = $line;
-                                        }elseif (!$inbox && ($webaddress['fragment'] != 'infobox')) {
-                                            $content[] = $line;
+                            // Remove all citation references if no citations requested.
+                            if (!$includecitations) {
+                                $possiblecitations = $doc->getElementsByTagName('sup');
+                                $fndcitationlinks = array();
+                                foreach ($possiblecitations as $citelink) {
+                                    if (in_array('reference', (explode(' ',  $citelink->getAttribute('class'))))) {
+                                        $fndcitationlinks[] = $citelink;
+                                    }
+                                }
+                                foreach ($fndcitationlinks as $citelink) {
+                                    if ($citelink->parentNode) {
+                                        $citelink->parentNode->removeChild($citelink);
+                                    }
+                                }
+                                // Now remove the citations themselves.
+                                foreach ($doc->getElementsByTagName('div') as $div) {
+                                    if (in_array('mw-references-wrap', (explode(' ',  $div->getAttribute('class'))))) {
+                                        if ($div->parentNode) {
+                                            $div->parentNode->removeChild($div);
+                                            break;
                                         }
                                     }
-                                    $result = implode("\n",$content);
                                 }
-                                //here we parse out all the stuff we do not need
-                                $result = $this->_CleanupRaw($result, $nolinks, $noimages);
+                            }
+
+                            // links
+                            $alllinks = $doc->getElementsByTagName('a');
+                            $changelinks = array();
+                            foreach ($alllinks as $link) {
+                                if ($href = $link->getAttribute('href')) {
+                                    if (strpos($href, '#') === 0) {
+                                        // Anchor links are allowed.
+                                        continue;
+                                    }
+                                    if ($nolinks) {
+                                        $changelinks[] = $link;
+                                    } else {
+                                        $pattern = '/^(http|https|ftp|mailto):\\/\\//i';
+                                        $isfullurl = preg_match($pattern, $href);
+                                        if(!$isfullurl){
+                                            // Is it an internal link
+                                            $hrefpattern = '|^/wiki/|i';
+                                            if (preg_match($hrefpattern, $href)) {
+                                                $href = preg_replace($hrefpattern, $this->wiki_content_url, $href);
+                                                $link->setAttribute('href', $href);
+                                            }
+                                        }
+                                        // We want all links to open in another window.
+                                        $link->setAttribute('target', '_blank');
+                                    }
+                                }
+                            }
+
+                            if ($nolinks && count($changelinks)) {
+                                foreach ($changelinks as $link) {
+                                    if ($newNode = $doc->createTextNode($link->textContent)) {
+                                        if ($textNode = $doc->importNode($newNode)) {
+                                            // Insert it before the link.
+                                            // $parentnode = $link->parentNode;
+                                            $link->parentNode->insertBefore($textNode, $link);
+                                            // And remove the link.
+                                            $link->parentNode->removeChild($link);
+                                            // echo ($parentnode->C14N());
+                                        }
+                                    }
+                                }
+                            }
+
+                            if ($section == 0) {
+                                // this is info box or premable.
+                                if ($webaddress['fragment'] == 'infobox') {
+                                    foreach ($doc->getElementsByTagName('table') as $table) {
+                                        if (in_array('infobox', (explode(' ' ,  $table->getAttribute('class'))))) {
+                                            $result = $table->C14N();
+                                            break;
+                                        }
+                                    }
+                                } else if ($webaddress['fragment'] == 'preamble') {
+                                    $newresult = '';
+                                    // High level paragraphs
+                                    foreach ($doc->getElementsByTagName('p') as $paragraph) {
+                                        $newresult .= $paragraph->C14N();
+                                    }
+                                    $result = $newresult;
+                                }
+
+                                if ($includecitations) {
+                                    //Add in citations
+                                    foreach ($doc->getElementsByTagName('div') as $div) {
+                                        if (in_array('mw-references-wrap', (explode(' ',  $div->getAttribute('class'))))) {
+                                            $result .= $div->C14N();
+                                            break;
+                                        }
+                                    }
+                                }
                             } else {
-                                //$result = html_entity_decode($response->parse->text);
-                                //$result = $this->_CleanupHTML($result);
+                                $result = '';       // Needs a reset for some reason.
+                                // we only want the contents of the body tag returned.
+                                $body = $doc->getElementsByTagName('body')->item(0);
+                                // perform innerhtml on $body by enumerating child nodes
+                                // and saving them individually
+                                foreach ($body->childNodes as $childNode) {
+                                    $result .= $childNode->C14N();
+                                }
                             }
-                        } else {
-                            if ($response) {
-                                $result = $response->error->code . ': ' . $response->error->info;
-                            }else{
-                                $result = 'No content returned.';
-                            }
-                            $this->_raiseError($result);
                         }
+                    } else {
+                        $this->_raiseError('Cannot Parse the response from the Wiki.');
                     }
+                } else {
+                    $this->_raiseError('Cannot read the output from the Wiki.');
                 }
-            }else{
+            } else {
                 // we deal with toc stuff here
-                if (!empty($this->toc)) {         //we have a valid table of contents
+                if (!empty($toc)) {         //we have a valid table of contents
                     // would love to let wikpedia do all the hard work but html tocs are not returned
                     $toc_html = array();
 
-                    if (true) {          // get a copy
-                         //now we make it into a php array for later code
-                         //<s toclevel="1" level="2" line="History" number="1" index="1" fromtitle="Seychelles" byteoffset="4678" anchor="History"/>
+                    if ($toc_obj = $this->_response2JSON($this->toc)) {          // get a copy
                          $last_level = 1;               //keep track of toc levels
                          $toc_html[] = '<ul>';          //start html list
-                         //$this->url
-                         foreach ($this->toc->parse->sections as $section) {
-                             $section = (array) $section;
-                             $linknumber = 0;
-                             $linktext = '';
-                             foreach ($section as $a => $b) {
-                                 switch (strtolower($a)) {
-                                     case 'toclevel':
-                                        //echo "'$a' = '$b' Level is at '$last_level'<br/>\n";
-                                        if (intval($b) > $last_level) {         //start a new level list
-                                            $toc_html[] = '<ul>';
-                                        }
-                                        if (intval($b) < $last_level) {     //end old level
-                                            $toc_html[] = '</ul>';
-                                        }
-                                            $last_level = intval($b);
-                                        break;
-                                     case 'number':
-                                        $linknumber = $b;
-                                        break;
-                                     case 'anchor':
-                                        $linktext = $linktext . '<a href="'. $this->url .'#' . $b . '">' . $b . '</a>';
-                                        break;
-                                  }
-                             }
-                             $toc_html[] = "<li>$linknumber. $linktext</li>";
+
+                         foreach ($toc_obj->parse->sections as $section) {
+                            $linknumber = 0;
+                            $linktext = '';
+
+                            $thislevel = intval($section->toclevel);
+                            if ($thislevel > $last_level) {         //start a new level list
+                                $toc_html[] = '<ul>';
+                            }
+                            if ($thislevel < $last_level) {     //end old level
+                                $toc_html[] = '</ul>';
+                            }
+                            $last_level = $thislevel;
+
+                            $linknumber = $section->number;
+                            $linktext = $linktext . '<a href="'. $this->url .'#' . $section->anchor . '">' . $section->anchor . '</a>';
+
+                            $toc_html[] = "<li>$linknumber. $linktext</li>";
                          }
                          $toc_html[] = '</ul>';
                     }
@@ -223,188 +328,99 @@ class WikipediaSnippet {
                     //let check if we have a redirect scenario
                     //echo htmlentities($this->toc);
                     //most wikipedia pages do have a table of contents f only the references section
-                    // can assume tghis is a redirection
+                    // can assume this is a redirection
                     $this->_raiseError('There does not appear to be a table of contents on this page - it may require redirection');
                 }
             }
         }
-        //
+        // Add in a Source message //
+        if ($result) {
+            $result .= "\n<p><small><em>Source: " . $this->wiki_source_msg . '</em></small></p>';
+        }
 
         return $result;
     }
 
-    // This one creates the API URL
+    //this one creates the API URL
     private function _makeWikiAPIcall(array $parms) {
-        return($this->wiki_api_url . '?' . http_build_query($parms, '', '&', PHP_QUERY_RFC3986));
+        return($this->wiki_api_url . '?' . http_build_query($parms, null, '&'));
     }
 
-    //
-    // this function is to clean up basic html & fix up internal links then make all links open in a new window
-    //
-    private function _CleanupHTML($html) {
-        //get rid of the edit link
-        //<span class="editsection">[<a href="/w/index.php?title=API&action=edit&section=1" title="Edit section: Dunciad and Moral Essays">edit</a>]</span>
-        $html= preg_replace('/<span class="editsection"(.*?)</span>/i', '' ,$html);
+    private function _response2JSON($json) {
 
-        //fixup all internal wikpedia links
-        $hrefpattern = '/wiki/i';
-        $html = preg_replace($hrefpattern, $this->wiki_content_url, $html);
+        if ($this->debugging) error_log("JSON response recasting in progress");
 
-        //fix up all links - open in new window
-        $html =  preg_replace('/<a href/i', '<a target="blank" href', $html);
-
-        return $html;
-    }
-
-    //
-    //this function cleans up the raw wiki text - removing images and links if required
-    //
-    private function _CleanupRaw($wikitext, $nolinks, $noimages) {
-        //remove any {{.+}} stuff in raw output
-        $wikitext= preg_replace('|{{.+}}|','',$wikitext);
-
-        //remove all the ref stuff - will removes references to page reference section embedded in those tags
-        $wikitext= preg_replace('|<ref(.+)/ref>|i','',$wikitext);
-        $wikitext= preg_replace('|<ref(.+)/>|i','',$wikitext);
-
-        //remove any citations references e.g.
-        //<sup id="cite_ref-0" class="reference"><a target="blank" href="#cite_note-0"><span>[</span>1<span>]</span></a></sup>
-        $wikitext= preg_replace('|<sup.+/sup>|i','',$wikitext);
-
-        // images
-        $images = array();
-        $imgpattern = '/(\[\[(File|Image):.+]]\n)/';
-
-        //if no images are required - we quitely remove them
-        if ($noimages) {
-            $wikitext= preg_replace($imgpattern,'',$wikitext);
-            $images = array();          //avoid anything relying on this later
+        $jsonobject = json_decode($json);
+        if (json_last_error() && $errmsg = json_last_error_msg()) {
+            $this->_raiseError($errmsg);
+            error_log("JSON ERROR: $errmsg");
         }
 
-        //links - strip out if not wanted
-        if ($nolinks) {
-            $links = array();
-            $linkpattern = '/\[\[(.+?)]+/';
-
-            //we tokenise images to avoid being caught by the next lot of regexs
-            // OUR TOKEN IS $IMAGE_[?]$
-            if (preg_match_all($imgpattern,$wikitext,$images)) {
-                $images = $images[1];
-                for ($i = 0; $i < count($images); $i++) {
-                    $token = '$IMAGE_'.$i.'$';
-                    $wikitext=str_replace($images[$i],$token,$wikitext);
-                }
-            }
-
-            //remove the brackets
-            preg_match_all($linkpattern,$wikitext,$links);          //find links
-
-            //keep the description if one is set otherwise use the link text
-            for ($i =0; $i < count($links[1]); $i++) {
-                $tmp = explode('|',$links[1][$i]);
-                if (count($tmp) > 1) {                              //avoiding PHP warnings
-                    $links[1][$i] = $tmp[1];
-                }else{
-                    $links[1][$i] = $tmp[0];
-                }
-            }
-
-            //now just replace each link with its text
-            for ($i =0; $i < count($links[0]); $i++) {
-                $wikitext = str_replace(($links[0][$i]),($links[1][$i]),$wikitext);
-            }
-
-            //TODO
-            //should replace any http:// etc text which will automatically made into links by the wikipedia parsers
-
-            //now if we have any tokens we replace them with the images we saved
-            if (count($images)) {
-                for ($i = 0; $i < count($images); $i++) {
-                    $token = '$IMAGE_'.$i.'$';
-                    $wikitext=str_replace($token,implode(' ',$images[$i]),$wikitext);
-                }
-            }
-
-        }
-        return $wikitext;
+        return $jsonobject;
     }
-
-    //-- DEPRACATED function to create an XML object from wikipedia xml responses
-    private function _response2XML($xml) {
-
-        if ($this->debugging) error_log("XML recasting in progress");
-
-        if ($xml) {
-            libxml_use_internal_errors(true);                                   //we want to catch any errors
-
-            if (!$xml = simplexml_load_string($xml)) {                          //turn into xml object
-                $xml = '';                      //redefine it
-                if ($xml_errs=libxml_get_errors()) {
-                    $this->_raiseError(count($xml_errs) . " XML Parsing errors, view error log for details");
-                    error_log(print_r($xml_errs,true));
-                }else{
-                    $this->_raiseError('Undefined error parsing response');
-                }
-            }
-        }
-
-        if ($this->debugging) error_log("XML being returned");
-
-        return $xml;
-    }
-
 
     // function to raise Errors
     private function _raiseError($errmsg) {
-        $this->error=$errmsg;
+        $this->error = $errmsg;
         if ($this->debugging) error_log($errmsg);
     }
 
+    private function print_die($item, $die=true) {
+        $output = '<pre>';
+        if (is_scalar($item)) {
+            $output .= $item;
+        } else {
+            $output .= print_r($item, true);
+        }
+        $output .= '</pre>';
+        if ($die) {
+            die($output);
+        } else {
+            echo $output;
+        }
+    }
+
+
     // function to get the table of contents for the wikipage
-    // the toc is cached for faster access and a copy of the xml is
+    // the toc is cached for faster access and a copy of the json is
     // always put in the objects toc property
     private function _get_toc($url) {
         if ($this->debugging) error_log("Getting Table of Contents");
 
         $toc_list = array();
 
-        if (empty($this->toc)) {                    //see if we have it already
+        if (!$this->toc) {   //see if we have it already
             //toc params
             $tocparms = array();
             $tocparms['format'] = 'json';
-            $tocparms['formatversion'] = 2;
             $tocparms['action'] = 'parse';
             $tocparms['prop'] = 'sections';
             $tocparms['page'] = $this->rawtitle;
             $tocparms['redirects'] = '';
             $toc_url = $this->_makeWikiAPIcall($tocparms);
 
-            if ($this->debugging) error_log("API call being made to '$toc_url'");
+            if ($this->debugging) error_log("TOC API call being made to '$toc_url'");
 
-            if ($toc = $this->_getWikiPage($toc_url)) {       // JSON format
-
-                if ($this->debugging) error_log("Non Error response returned, JSON response being turned into array");
-
-                if ($this->toc = json_decode($toc)) {
-
-                    $this->pageid = $this->toc->parse->pageid;
-                    $this->title = $this->toc->parse->title;
-
-                    foreach ($this->toc->parse->sections as $ndx => $section) {
-                         $toc_list[$section->anchor] = $ndx;
-                     }
-                }
-                $this->toclookup = $toc_list;
+            if ($this->toc = $this->_getWikiPage($toc_url)) {
+                if ($this->debugging) error_log("Non Error response returned, json being turned into object");
             }else{
-                if ($this->debugging) error_log('TOC JSON has not been returned by request');
+                if ($this->debugging) error_log('TOC has not been returned by request');
             }
         }
+
+        if ($this->toc && ($toc_obj = $this->_response2JSON($this->toc))) {
+            foreach ($toc_obj->parse->sections as $section) {
+                $toc_list[$section->anchor] = $section->index;
+            }
+        }
+
+        return $toc_list;
     }
 
     //
-    //  default with no params is true - otherwise true or false - any other params turns it off i.e. false
+    //  default with no params is true - otherwise true or false - anyother params turns it off i.e. false
     //
-    public function setdebugging($on_off = true) {
+    public function setdebugging($on_off=true) {
         if (($on_off === false) || ($on_off === true)) {
             $this->debugging = $on_off;
         }else{
@@ -413,11 +429,11 @@ class WikipediaSnippet {
     }
 
     //
-    // function to get the page from wikipedia and fix post params if required.
+    // function to get the page from wikipedia and check for errors before returning json object
     //
     private function _getWikiPage($url, $post=false) {
         $postFields = '';
-        if ($post) {        // If HTTP POST required - split the URL for the cURL lib
+        if ($post) {        //if HTTP POST required - split the URL for the cURL lib
             list($url, $postFields) = explode('?', $url);
         }
         return($this->_getPagefromWikimedia($url, $postFields));
@@ -426,19 +442,15 @@ class WikipediaSnippet {
     //
     //  function to get the raw content from wikipedia
     //
-    private function _getPagefromWikimedia($url, $postFields = '') {
-        if ($this->debugging) error_log("Making cURL HTTP Request = " . $url);
-
+    private function _getPagefromWikimedia($url, $postFields='') {
+        if ($this->debugging) error_log("Making cURL HTTP Request");
         $session = curl_init($url);
 
         curl_setopt( $session, CURLOPT_URL, $url );
         curl_setopt( $session, CURLOPT_USERAGENT, $this->useragent);               //wikipedia insists on a useragent
         curl_setopt( $session, CURLOPT_HEADER, false );
-
-        // SSL options
-        curl_setopt( $session, CURLOPT_SSL_VERIFYPEER, false);
-        // curl_setopt( $session, CURLOPT_PROXY_SSL_VERIFYPEER, false);
-        curl_setopt( $session, CURLOPT_SSL_VERIFYSTATUS, false);
+        curl_setopt( $session, CURLOPT_FOLLOWLOCATION, true);
+        curl_setopt( $session, CURLOPT_MAXREDIRS, 5);
 
         //if we need to set a proxy.check in the environment
         if ($this->http_proxy) {
@@ -446,7 +458,6 @@ class WikipediaSnippet {
         }
 
         curl_setopt( $session, CURLOPT_RETURNTRANSFER, 1 );
-
         if (!empty($postFields)) {
             curl_setopt( $session, CURLOPT_HTTPHEADER, array('Expect:'));           //workaround for error caused by a wikipedia squid being a HTTP1.0 device -
                                                                                     //http://serverfault.com/questions/107813/why-does-squid-reject-this-multipart-form-data-post-from-curl
@@ -458,10 +469,9 @@ class WikipediaSnippet {
 
         $result = curl_exec( $session );
         if ($err = curl_error($session)) {
-            $err = "cURL request error - $err";
+            $err = "HTTP request error - $err";
             if ($this->debugging) error_log($err);
             $this->error = $err;
-            $result = '';
         }
 
         if ($this->debugging){
@@ -474,5 +484,3 @@ class WikipediaSnippet {
         return $result;
     }
 }
-
-?>
